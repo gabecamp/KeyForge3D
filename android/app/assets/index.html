@@ -46,8 +46,18 @@ canvas{display:block;width:100%;border-radius:8px;background:#0b0f14}
       <label>Cuts<input id="cuts" type="number" value="5" min="1" max="9" step="1"></label>
     </div>
     <div class="row">
-      <label>Key type<select id="ktype"><option value="generic">Generic (0.33 mm steps)</option><option value="schlage">Schlage SC1 (0-9)</option><option value="kwikset">Kwikset KW1 (1-7)</option></select></label>
+      <label>Key type<select id="ktype"><option value="generic">Generic (0.33 mm steps)</option><option value="schlage">Schlage SC1 (0-9)</option><option value="kwikset">Kwikset KW1 (1-7)</option><option value="lw4">Lockwood LW4 / C4 / Whitco (5 pin, 0-10)</option><option value="lw5">Lockwood LW5 (6 pin, 0-10)</option><option value="custom">Custom (enter spec)</option></select></label>
       <label>Print tolerance (mm)<input id="tol" type="number" value="0.1" min="0" max="0.5" step="0.05"></label>
+    </div>
+    <div id="specPanel" class="hidden">
+      <div class="hint" id="specNote"></div>
+      <div class="row"><label>Pins<input id="sp_pins" type="number" value="5" min="1" max="9"></label>
+        <label>Depths (count)<input id="sp_n" type="number" value="11" min="2" max="20"></label>
+        <label>Depth 0 is<select id="sp_dir"><option value="tall">tallest blade</option><option value="short">shortest blade</option></select></label></div>
+      <div class="row"><label>First cut from shoulder (mm)<input id="sp_first" type="number" step="0.01" placeholder="from decoder"></label>
+        <label>Cut spacing (mm)<input id="sp_space" type="number" step="0.01" placeholder="from decoder"></label></div>
+      <div class="row"><label>Blade height at depth 0 (mm)<input id="sp_h0" type="number" step="0.01" placeholder="from decoder"></label>
+        <label>Depth step (mm)<input id="sp_step" type="number" step="0.01" placeholder="from decoder"></label></div>
     </div>
     <div class="thr">Threshold adjust <span id="thrv">0</span>
       <input id="thr" type="range" min="-60" max="60" value="0"></div>
@@ -215,6 +225,29 @@ const KEYTYPES = {
   kwikset: {inc: 0.584, first: 1, last: 7, pins: 5, spec: true, firstCut: 0.247 * 25.4, spacing: 0.153 * 25.4,
             height: d => (0.329 - 0.023 * (d - 1)) * 25.4}
 };
+// Australian profiles: only facts confirmed from supplier listings are preset (pins, 0-10 depths, LW4 blank width).
+// Spacing / first cut / depth step are NOT preset: read them off a decoder card or gauge for your lock.
+const SPEC_PRESETS = {
+  lw4: {pins: 5, n: 11, blankMm: 8.8, note: 'Lockwood LW4 / C4 / Whitco: 5 pins, depths 0-10, blank width 8.8 mm. Enter the cut spacing, first-cut offset and depth step from a Lockwood decoder card or gauge.'},
+  lw5: {pins: 6, n: 11, note: 'Lockwood LW5: 6 pins, depths 0-10. Enter the cut spacing, first-cut offset and depth step from a decoder card or gauge.'},
+  custom: {pins: 5, n: 10, note: 'Enter the key system\'s spec (any profile, e.g. Yale or Gainsborough) from a decoder card, gauge or code book.'}
+};
+function getKT() {
+  const k = $('ktype').value;
+  if (!SPEC_PRESETS[k]) return KEYTYPES[k];
+  const g = id => parseFloat($(id).value);
+  const pins = g('sp_pins') | 0, n = g('sp_n') | 0, first = g('sp_first'), space = g('sp_space'), h0 = g('sp_h0'), step = g('sp_step');
+  if (!(pins >= 1 && n >= 2 && first > 0 && space > 0 && h0 > 0 && step > 0))
+    throw new Error('This key type needs its spec: enter first-cut offset, cut spacing, depth-0 blade height and depth step (mm) from a decoder card or gauge.');
+  const tall = $('sp_dir').value === 'tall';
+  return {inc: step, first: 0, last: n - 1, pins, spec: true, firstCut: first, spacing: space,
+          height: d => tall ? h0 - step * d : h0 + step * d, blankMm: SPEC_PRESETS[k].blankMm};
+}
+function updateSpecPanel() {
+  const k = $('ktype').value, p = SPEC_PRESETS[k];
+  $('specPanel').classList.toggle('hidden', !p);
+  if (p) { $('specNote').textContent = p.note; $('sp_pins').value = p.pins; $('sp_n').value = p.n; $('sp_pins').disabled = k !== 'custom'; }
+}
 function segment(gray, w, h, adjust) {
   // polarity: background = what the image border looks like
   let bs = 0, bn = 0;
@@ -417,14 +450,16 @@ function estimateBittingSpec(m, W, H, mmPerPx, kt) {
     code.push(bd); heights.push(h); resid.push(br);
   }
   const good = resid.filter(r => !isNaN(r));
-  const warn = good.length < kt.pins || good.some(r => r > 0.6 * kt.inc);
+  let blankBad = false;
+  if (kt.blankMm) { let hb = 0; for (let x = xs + 2; x < W; x++) hb = Math.max(hb, hgt(x)); blankBad = Math.abs(hb * mmPerPx - kt.blankMm) > 0.15 * kt.blankMm; }
+  const warn = blankBad || good.length < kt.pins || good.some(r => r > 0.6 * kt.inc);
   return {code, depths: heights, resid, warn, side: useBottom ? 'bottom' : 'top', shoulderMm: xs * mmPerPx, spec: true};
 }
 
 function process(adjust) {
   if (!state.img) return;
   const t0 = performance.now();
-  const KT = KEYTYPES[$('ktype').value], TOL = Math.max(0, +$('tol').value || 0), L = Math.max(10, +$('len').value || 60), T = Math.max(0.5, +$('thick').value || 2), CUTS = KT.pins || Math.max(1, Math.min(9, +$('cuts').value | 0 || 5));
+  const KT = getKT(), TOL = Math.max(0, +$('tol').value || 0), L = Math.max(10, +$('len').value || 60), T = Math.max(0.5, +$('thick').value || 2), CUTS = KT.pins || Math.max(1, Math.min(9, +$('cuts').value | 0 || 5));
   const {c, w, h, data} = loadToCanvas(state.img);
   const gray = toGray(data, w, h);
   const seg = segment(gray, w, h, adjust);
@@ -579,10 +614,11 @@ function run() {
     $('code').textContent = r.code.length ? r.code.join('') : '-';
     $('dims').textContent = `${r.widthMm.toFixed(1)} x ${r.heightMm.toFixed(1)} x ${r.thickMm.toFixed(1)} mm · ${r.tris} triangles` +
       (r.depths ? (r.spec ? ` · blade height at each pin: ${r.depths.map(d => d.toFixed(2)).join(', ')} mm (match error ${r.resid.map(d => d.toFixed(2)).join(', ')})` : ` · cuts on ${r.side} edge: ${r.depths.map(d => d.toFixed(2)).join(', ')} mm`) : '') +
-      (r.warn ? ' · WARNING: measured depths exceed this key type\'s range, so the code is unreliable (wrong key type, or blade not fully detected).' : '');
+      (r.warn ? ' · WARNING: measurements do not fit this key type (wrong type, wrong scale/length, or blade not fully detected), so the code is unreliable.' : '');
     $('save').disabled = $('saveObj').disabled = $('share').disabled = false;
     setStatus((r.scaledByCard ? 'Key detected; scaled from the card in the photo' : 'Key detected; scaled from the length you entered') + ' (' + r.ms + ' ms).');
   } catch (e) {
+    state.result = null; state.geometry = null;
     $('save').disabled = $('saveObj').disabled = $('share').disabled = true; $('resCard').classList.add('hidden');
     setStatus(e.message || String(e), true);
   }
@@ -596,7 +632,8 @@ function loadFile(f) {
 $('file').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 $('thr').addEventListener('input', e => { $('thrv').textContent = e.target.value; });
 $('thr').addEventListener('change', run);
-for (const id of ['len', 'thick', 'cuts', 'ktype', 'tol']) $(id).addEventListener('change', run);
+$('ktype').addEventListener('change', updateSpecPanel);
+for (const id of ['len', 'thick', 'cuts', 'ktype', 'tol', 'sp_pins', 'sp_n', 'sp_dir', 'sp_first', 'sp_space', 'sp_h0', 'sp_step']) $(id).addEventListener('change', run);
 $('save').addEventListener('click', () => exportFile('stl'));
 $('saveObj').addEventListener('click', () => exportFile('obj'));
 $('share').addEventListener('click', () => exportFile('stl', true));
