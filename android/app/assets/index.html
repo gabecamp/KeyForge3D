@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>KeyForge3D</title>
+<style>
+:root{--bg:#0f141b;--card:#18202b;--line:#263243;--fg:#e8eef6;--mut:#8fa0b5;--acc:#22c5e8;--acc2:#0e8fb0}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif;-webkit-tap-highlight-color:transparent}
+main{max-width:720px;margin:0 auto;padding:14px 16px 28px}
+h1{font-size:20px;margin:6px 0 2px}
+.sub{color:var(--mut);margin:0 0 12px;font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+.btn{display:block;width:100%;text-align:center;background:var(--acc);color:#04222b;border:0;border-radius:10px;padding:13px;font-size:16px;font-weight:600}
+.btn.sec{background:transparent;color:var(--acc);border:1px solid var(--acc2)}
+.btn:disabled{opacity:.4}
+input[type=file]{display:none}
+.row{display:flex;gap:10px;margin-top:10px}
+.row label{flex:1;font-size:12px;color:var(--mut)}
+.row select,.row input[type=number]{width:100%;margin-top:3px;background:#0f141b;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px;font-size:15px}
+.thr{margin-top:10px;font-size:12px;color:var(--mut)}
+.thr input{width:100%}
+canvas{display:block;width:100%;border-radius:8px;background:#0b0f14}
+#view{aspect-ratio:4/3;touch-action:none}
+#status{font-size:14px;margin:0 0 8px}
+#status.err{color:#ff8a8a}
+.code{font:700 34px/1 ui-monospace,monospace;letter-spacing:6px;color:var(--acc);margin:4px 0}
+.meta{color:var(--mut);font-size:13px}
+.hint{color:var(--mut);font-size:12px;margin-top:6px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <h1>KeyForge3D</h1>
+  <p class="sub">Photo of a key &rarr; 3D model &rarr; STL for printing</p>
+
+  <div class="card">
+    <div class="row" style="margin-top:0"><label class="btn" for="file" id="pick">Choose photo</label><label class="btn sec" for="cam" id="camBtn">Take photo</label></div>
+    <input id="file" type="file" accept="image/*">
+    <input id="cam" type="file" accept="image/*" capture="environment">
+    <div class="row">
+      <label>Key length (mm)<input id="len" type="number" value="60" min="10" max="200" step="1"></label>
+      <label>Thickness (mm)<input id="thick" type="number" value="2" min="0.5" max="10" step="0.1"></label>
+      <label>Cuts<input id="cuts" type="number" value="5" min="1" max="9" step="1"></label>
+    </div>
+    <div class="row">
+      <label>Key type<select id="ktype"><option value="generic">Generic (0.33 mm steps)</option><option value="schlage">Schlage SC1 (0-9)</option><option value="kwikset">Kwikset KW1 (1-7)</option></select></label>
+      <label>Print tolerance (mm)<input id="tol" type="number" value="0.1" min="0" max="0.5" step="0.05"></label>
+    </div>
+    <div class="thr">Threshold adjust <span id="thrv">0</span>
+      <input id="thr" type="range" min="-60" max="60" value="0"></div>
+    <div class="hint">Lay the key flat on a plain contrasting background, photographed straight on. For true scale, put a credit/ID card in the shot (not touching the key); otherwise the key length above is used.</div>
+  </div>
+
+  <div class="card">
+    <p id="status">Choose a photo to begin.</p>
+    <canvas id="prev" class="hidden"></canvas>
+  </div>
+
+  <div class="card hidden" id="resCard">
+    <div class="meta">Estimated bitting code</div>
+    <div class="code" id="code">-</div>
+    <div class="meta" id="dims"></div>
+  </div>
+
+  <div class="card">
+    <div class="meta" style="margin-bottom:8px">3D preview &mdash; drag to rotate, pinch / scroll to zoom</div>
+    <canvas id="view"></canvas>
+    <div style="height:10px"></div>
+    <div class="row" style="margin-top:0"><button class="btn sec" id="save" disabled>Save STL</button><button class="btn sec" id="saveObj" disabled>Save OBJ</button><button class="btn sec" id="share" disabled>Share</button></div>
+  </div>
+</main>
+
+<script src="three.min.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const state = {img: null, geometry: null, result: null};
+window.__kf = state;
+
+/* ---------------- image processing ---------------- */
+const MAXDIM = 700;
+
+function loadToCanvas(img) {
+  const s = Math.min(1, MAXDIM / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d', {willReadFrequently: true});
+  g.drawImage(img, 0, 0, w, h);
+  return {c, w, h, data: g.getImageData(0, 0, w, h).data};
+}
+
+function toGray(data, w, h) {
+  const g = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) g[i] = 0.299 * data[4*i] + 0.587 * data[4*i+1] + 0.114 * data[4*i+2];
+  // 3x3 box blur
+  const o = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx >= 0 && yy >= 0 && xx < w && yy < h) { s += g[yy*w+xx]; n++; }
+    }
+    o[y*w+x] = s / n;
+  }
+  return o;
+}
+
+function otsu(g) {
+  const hist = new Float64Array(256);
+  for (const v of g) hist[Math.max(0, Math.min(255, v | 0))]++;
+  const total = g.length; let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sB = 0, wB = 0, best = 0, thr = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sB += t * hist[t];
+    const mB = sB / wB, mF = (sum - sB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > best) { best = v; thr = t; }
+  }
+  return thr;
+}
+
+// largest 4-connected component of mask==1
+function largestComponent(mask, w, h) {
+  const lab = new Int32Array(w * h); let best = 0, bestId = 0, id = 0;
+  const stack = new Int32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    if (!mask[i] || lab[i]) continue;
+    id++; let sp = 0, n = 0; stack[sp++] = i; lab[i] = id;
+    while (sp) {
+      const p = stack[--sp]; n++;
+      const x = p % w, y = (p / w) | 0;
+      if (x > 0 && mask[p-1] && !lab[p-1]) { lab[p-1] = id; stack[sp++] = p-1; }
+      if (x < w-1 && mask[p+1] && !lab[p+1]) { lab[p+1] = id; stack[sp++] = p+1; }
+      if (y > 0 && mask[p-w] && !lab[p-w]) { lab[p-w] = id; stack[sp++] = p-w; }
+      if (y < h-1 && mask[p+w] && !lab[p+w]) { lab[p+w] = id; stack[sp++] = p+w; }
+    }
+    if (n > best) { best = n; bestId = id; }
+  }
+  const out = new Uint8Array(w * h);
+  if (bestId) for (let i = 0; i < w * h; i++) out[i] = lab[i] === bestId ? 1 : 0;
+  return {mask: out, area: best};
+}
+
+function closeMask(mask, w, h, r) {
+  const pass = (src, grow) => {
+    const o = new Uint8Array(w * h), tmp = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = grow ? 0 : 1;
+      for (let d = -r; d <= r; d++) { const xx = x + d; const q = (xx >= 0 && xx < w) ? src[y*w+xx] : 0; if (grow ? q : !q) { v = grow ? 1 : 0; break; } }
+      tmp[y*w+x] = v; }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = grow ? 0 : 1;
+      for (let d = -r; d <= r; d++) { const yy = y + d; const q = (yy >= 0 && yy < h) ? tmp[yy*w+x] : 0; if (grow ? q : !q) { v = grow ? 1 : 0; break; } }
+      o[y*w+x] = v; }
+    return o;
+  };
+  return pass(pass(mask, true), false);
+}
+// all 4-connected components >= minArea, as arrays of pixel indices (largest first)
+function listComponents(mask, w, h, minArea) {
+  const seen = new Uint8Array(w * h), stack = new Int32Array(w * h), out = [];
+  for (let i = 0; i < w * h; i++) {
+    if (!mask[i] || seen[i]) continue;
+    let sp = 0; const px = []; stack[sp++] = i; seen[i] = 1;
+    while (sp) {
+      const p = stack[--sp]; px.push(p);
+      const x = p % w, y = (p / w) | 0;
+      if (x > 0 && mask[p-1] && !seen[p-1]) { seen[p-1] = 1; stack[sp++] = p-1; }
+      if (x < w-1 && mask[p+1] && !seen[p+1]) { seen[p+1] = 1; stack[sp++] = p+1; }
+      if (y > 0 && mask[p-w] && !seen[p-w]) { seen[p-w] = 1; stack[sp++] = p-w; }
+      if (y < h-1 && mask[p+w] && !seen[p+w]) { seen[p+w] = 1; stack[sp++] = p+w; }
+    }
+    if (px.length >= minArea) out.push(px);
+  }
+  return out.sort((a, b) => b.length - a.length);
+}
+
+// Look for an ISO/ID-1 card (85.6 x 53.98 mm) among the non-key blobs: returns its long side in px, or 0
+function findCard(comps, w) {
+  for (let ci = 0; ci < comps.length; ci++) {
+    const px = comps[ci];
+    let mx = 0, my = 0; for (const p of px) { mx += p % w; my += (p / w) | 0; }
+    mx /= px.length; my /= px.length;
+    let sxx = 0, syy = 0, sxy = 0;
+    for (const p of px) { const dx = p % w - mx, dy = ((p / w) | 0) - my; sxx += dx*dx; syy += dy*dy; sxy += dx*dy; }
+    const a = 0.5 * Math.atan2(2 * sxy, sxx - syy), ca = Math.cos(a), sa = Math.sin(a);
+    let u0 = 1e9, u1 = -1e9, v0 = 1e9, v1 = -1e9;
+    for (const p of px) { const dx = p % w - mx, dy = ((p / w) | 0) - my, u = dx*ca + dy*sa, v = -dx*sa + dy*ca;
+      if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v; }
+    const U = u1 - u0 + 1, V = v1 - v0 + 1, ratio = Math.max(U, V) / Math.min(U, V), fill = px.length / (U * V);
+    if (ratio > 1.45 && ratio < 1.75 && fill > 0.9) return {idx: ci, px: Math.max(U, V)};
+  }
+  return null;
+}
+
+function erodeMask(mask, w, h, r) {
+  const tmp = new Uint8Array(w * h), o = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = 1;
+    for (let d = -r; d <= r; d++) { const xx = x + d; if (xx < 0 || xx >= w || !mask[y*w+xx]) { v = 0; break; } }
+    tmp[y*w+x] = v; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = 1;
+    for (let d = -r; d <= r; d++) { const yy = y + d; if (yy < 0 || yy >= h || !tmp[yy*w+x]) { v = 0; break; } }
+    o[y*w+x] = v; }
+  return o;
+}
+const KEYTYPES = {
+  generic: {inc: 0.33,  first: 0, last: 9, pins: 0},
+  schlage: {inc: 0.381, first: 0, last: 9, pins: 5},   // 0.015" steps
+  kwikset: {inc: 0.584, first: 1, last: 7, pins: 5}    // 0.023" steps
+};
+function segment(gray, w, h, adjust) {
+  // polarity: background = what the image border looks like
+  let bs = 0, bn = 0;
+  for (let x = 0; x < w; x++) { bs += gray[x] + gray[(h-1)*w+x]; bn += 2; }
+  for (let y = 1; y < h-1; y++) { bs += gray[y*w] + gray[y*w+w-1]; bn += 2; }
+  const bgMean = bs / bn;
+  const thr = otsu(gray) + adjust;
+  const fgIsDark = bgMean > thr;
+  const mask = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) mask[i] = (fgIsDark ? gray[i] < thr : gray[i] > thr) ? 1 : 0;
+  return {mask, thr};
+}
+
+// fill-free: keep holes (key ring hole). Remove specks smaller than minArea inside bg.
+function removeSmallHoles(mask, w, h, minArea) {
+  const inv = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) inv[i] = mask[i] ? 0 : 1;
+  const lab = new Int32Array(w * h), stack = new Int32Array(w * h);
+  let id = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (!inv[i] || lab[i]) continue;
+    id++; let sp = 0; const members = []; let border = false;
+    stack[sp++] = i; lab[i] = id;
+    while (sp) {
+      const p = stack[--sp]; members.push(p);
+      const x = p % w, y = (p / w) | 0;
+      if (x === 0 || y === 0 || x === w-1 || y === h-1) border = true;
+      if (x > 0 && inv[p-1] && !lab[p-1]) { lab[p-1] = id; stack[sp++] = p-1; }
+      if (x < w-1 && inv[p+1] && !lab[p+1]) { lab[p+1] = id; stack[sp++] = p+1; }
+      if (y > 0 && inv[p-w] && !lab[p-w]) { lab[p-w] = id; stack[sp++] = p-w; }
+      if (y < h-1 && inv[p+w] && !lab[p+w]) { lab[p+w] = id; stack[sp++] = p+w; }
+    }
+    if (!border && members.length < minArea) for (const p of members) mask[p] = 1;
+  }
+}
+
+// rotate mask so the long axis is horizontal, bow (wider end) on the left
+function alignMask(mask, w, h) {
+  let n = 0, mx = 0, my = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (mask[y*w+x]) { n++; mx += x; my += y; }
+  if (!n) return null;
+  mx /= n; my /= n;
+  let sxx = 0, syy = 0, sxy = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (mask[y*w+x]) {
+    const dx = x - mx, dy = y - my; sxx += dx*dx; syy += dy*dy; sxy += dx*dy;
+  }
+  let ang = 0.5 * Math.atan2(2 * sxy, sxx - syy); // principal axis angle
+  const build = a => {
+    const ca = Math.cos(a), sa = Math.sin(a);
+    // forward: u = (x-mx)*ca + (y-my)*sa ; v = -(x-mx)*sa + (y-my)*ca
+    let umin = 1e9, umax = -1e9, vmin = 1e9, vmax = -1e9;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (mask[y*w+x]) {
+      const u = (x-mx)*ca + (y-my)*sa, v = -(x-mx)*sa + (y-my)*ca;
+      if (u < umin) umin = u; if (u > umax) umax = u; if (v < vmin) vmin = v; if (v > vmax) vmax = v;
+    }
+    const W = Math.ceil(umax - umin) + 5, H = Math.ceil(vmax - vmin) + 5;
+    const out = new Uint8Array(W * H);
+    // inverse mapping with a 2x2 nearest-average to keep edges smooth
+    for (let Y = 0; Y < H; Y++) for (let X = 0; X < W; X++) {
+      const u = X + umin - 2, v = Y + vmin - 2;
+      const x = Math.round(u*ca - v*sa + mx), y = Math.round(u*sa + v*ca + my);
+      if (x >= 0 && y >= 0 && x < w && y < h && mask[y*w+x]) out[Y*W+X] = 1;
+    }
+    return {m: out, W, H};
+  };
+  let r = build(ang);
+  // bow = wider end: compare mean column thickness over first/last 20%
+  const colThick = (m, W, H) => { const t = new Float32Array(W); for (let x = 0; x < W; x++) { let c = 0; for (let y = 0; y < H; y++) c += m[y*W+x]; t[x] = c; } return t; };
+  const t = colThick(r.m, r.W, r.H);
+  let a = 0, b = 0; const k = Math.max(1, Math.floor(r.W * 0.2));
+  for (let i = 0; i < k; i++) { a += t[i]; b += t[r.W-1-i]; }
+  if (b > a) r = build(ang + Math.PI); // rotate 180 so bow is left
+  return r;
+}
+
+// boundary loops via pixel-edge chaining (clockwise outers, ccw holes in y-down coords)
+function boundaryLoops(m, W, H) {
+  const at = (x, y) => (x >= 0 && y >= 0 && x < W && y < H) ? m[y*W+x] : 0;
+  const key = (x, y) => y * (W + 1) + x;
+  const next = new Map();
+  const add = (x1, y1, x2, y2) => {
+    const k = key(x1, y1); let l = next.get(k); if (!l) next.set(k, l = []);
+    l.push([x2, y2]);
+  };
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (m[y*W+x]) {
+    if (!at(x, y-1)) add(x, y, x+1, y);
+    if (!at(x+1, y)) add(x+1, y, x+1, y+1);
+    if (!at(x, y+1)) add(x+1, y+1, x, y+1);
+    if (!at(x-1, y)) add(x, y+1, x, y);
+  }
+  const loops = [];
+  for (const [k0, list0] of next) {
+    while (list0.length) {
+      const sx = k0 % (W + 1), sy = (k0 / (W + 1)) | 0;
+      const pts = [[sx, sy]]; let cx = sx, cy = sy, guard = 0;
+      for (;;) {
+        const l = next.get(key(cx, cy));
+        if (!l || !l.length) break;
+        const n = l.pop(); cx = n[0]; cy = n[1];
+        if (cx === sx && cy === sy) break;
+        pts.push([cx, cy]);
+        if (++guard > 5e6) break;
+      }
+      if (pts.length > 3) loops.push(pts);
+    }
+  }
+  return loops;
+}
+
+function area(p) { let s = 0; for (let i = 0; i < p.length; i++) { const a = p[i], b = p[(i+1)%p.length]; s += a[0]*b[1] - b[0]*a[1]; } return s / 2; }
+
+function dp(pts, eps) { // Douglas-Peucker on a closed loop
+  if (pts.length < 8) return pts;
+  // split at the two farthest-apart-ish points: index 0 and farthest from it
+  let fi = 0, fd = -1;
+  for (let i = 1; i < pts.length; i++) { const d = (pts[i][0]-pts[0][0])**2 + (pts[i][1]-pts[0][1])**2; if (d > fd) { fd = d; fi = i; } }
+  const a = pts.slice(0, fi + 1), b = pts.slice(fi).concat([pts[0]]);
+  const simp = (p) => {
+    const keep = new Uint8Array(p.length); keep[0] = keep[p.length-1] = 1;
+    const st = [[0, p.length-1]];
+    while (st.length) {
+      const [s, e] = st.pop();
+      const [x1, y1] = p[s], [x2, y2] = p[e]; const dx = x2-x1, dy = y2-y1, L = Math.hypot(dx, dy) || 1;
+      let md = 0, mi = -1;
+      for (let i = s+1; i < e; i++) { const d = Math.abs(dy*(p[i][0]-x1) - dx*(p[i][1]-y1)) / L; if (d > md) { md = d; mi = i; } }
+      if (md > eps && mi > 0) { keep[mi] = 1; st.push([s, mi], [mi, e]); }
+    }
+    return p.filter((_, i) => keep[i]);
+  };
+  const sa = simp(a), sb = simp(b);
+  return sa.slice(0, -1).concat(sb.slice(0, -1));
+}
+
+function chaikin(p, it) {
+  for (let k = 0; k < it; k++) {
+    const q = [];
+    for (let i = 0; i < p.length; i++) {
+      const a = p[i], b = p[(i+1)%p.length];
+      q.push([0.75*a[0]+0.25*b[0], 0.75*a[1]+0.25*b[1]], [0.25*a[0]+0.75*b[0], 0.25*a[1]+0.75*b[1]]);
+    }
+    p = q;
+  }
+  return p;
+}
+
+function estimateBitting(m, W, H, mmPerPx, cuts, kt) {
+  const top = new Float32Array(W).fill(-1), bot = new Float32Array(W).fill(-1);
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < H; y++) if (m[y*W+x]) { top[x] = y; break; }
+    for (let y = H-1; y >= 0; y--) if (m[y*W+x]) { bot[x] = y; break; }
+  }
+  const x0 = Math.floor(W * 0.5), x1 = W - 1;
+  const cols = []; for (let x = x0; x <= x1; x++) if (top[x] >= 0) cols.push(x);
+  if (cols.length < cuts * 3) return {code: [], note: 'blade too short'};
+  const varOf = a => { const v = cols.map(x => a[x]); const mu = v.reduce((s, q) => s + q, 0) / v.length; return v.reduce((s, q) => s + (q-mu)**2, 0) / v.length; };
+  const useBottom = varOf(bot) >= varOf(top);
+  // uncut reference: the extreme (outermost) edge position along the blade
+  const edge = x => useBottom ? bot[x] : top[x];
+  let ref = useBottom ? -1e9 : 1e9;
+  for (const x of cols.slice(Math.floor(cols.length * 0.05))) ref = useBottom ? Math.max(ref, edge(x)) : Math.min(ref, edge(x));
+  const code = [], depths = [];
+  const seg = Math.floor(cols.length / cuts);
+  for (let i = 0; i < cuts; i++) {
+    const part = cols.slice(i * seg + Math.floor(seg * 0.2), (i + 1) * seg - Math.floor(seg * 0.2));
+    if (!part.length) { code.push(0); depths.push(0); continue; }
+    const d = part.reduce((s, x) => s + Math.abs(ref - edge(x)), 0) / part.length * mmPerPx;
+    depths.push(d);
+    code.push(Math.max(kt.first, Math.min(kt.last, kt.first + Math.round(d / kt.inc))));
+  }
+  const range = (kt.last - kt.first) * kt.inc, warn = Math.max(...depths) > range * 1.3;
+  return {code, depths: code.map(c => (c - kt.first) * kt.inc), rawDepths: depths, warn, side: useBottom ? 'bottom' : 'top'};
+}
+
+function process(adjust) {
+  if (!state.img) return;
+  const t0 = performance.now();
+  const KT = KEYTYPES[$('ktype').value], TOL = Math.max(0, +$('tol').value || 0), L = Math.max(10, +$('len').value || 60), T = Math.max(0.5, +$('thick').value || 2), CUTS = KT.pins || Math.max(1, Math.min(9, +$('cuts').value | 0 || 5));
+  const {c, w, h, data} = loadToCanvas(state.img);
+  const gray = toGray(data, w, h);
+  const seg = segment(gray, w, h, adjust);
+  const closed = closeMask(seg.mask, w, h, 4);
+  const comps = listComponents(closed, w, h, w * h * 0.005);
+  const keyMask = new Uint8Array(w * h);
+  // a card only counts if some other blob remains to be the key
+  const card = comps.length > 1 ? findCard(comps, w) : null;
+  const cardPx = card ? card.px : 0;
+  const keyPx = comps.filter((_, i) => !card || i !== card.idx)[0];
+  if (keyPx) for (const p of keyPx) keyMask[p] = 1;
+  const comp = {mask: keyMask, area: keyPx ? keyPx.length : 0};
+  if (comp.area < w * h * 0.01) throw new Error('No key found. Use a plain, contrasting background.');
+  removeSmallHoles(comp.mask, w, h, 30);
+  const al = alignMask(comp.mask, w, h);
+  if (!al) throw new Error('Could not align the key.');
+  const {m, W, H} = al;
+  const ar = W / H;
+  if (ar < 1.8) throw new Error('Shape does not look like a key (aspect ' + ar.toFixed(1) + '). Adjust the threshold or retake the photo.');
+
+  // trace outlines
+  const tolPx = Math.min(5, Math.round(TOL / (cardPx ? 85.6 / cardPx : L / W)));
+  const mt = tolPx > 0 ? erodeMask(m, W, H, tolPx) : m;
+  const loops = boundaryLoops(mt, W, H).map(p => ({p, a: area(p)})).sort((x, y) => Math.abs(y.a) - Math.abs(x.a));
+  const outer = loops[0];
+  const holes = loops.slice(1).filter(l => Math.sign(l.a) !== Math.sign(outer.a) && Math.abs(l.a) > 40);
+  const mmPerPx = cardPx ? 85.6 / cardPx : L / W;  // card in frame -> real scale, else typed length
+  const scaledByCard = !!cardPx;
+  const prep = p => chaikin(dp(p, 1.0), 1);
+  const outerPts = prep(outer.p), holePts = holes.map(l => prep(l.p));
+
+  // three.js shape (x right, y up); center on bbox
+  const cx = W / 2, cy = H / 2;
+  const toV = ([x, y]) => new THREE.Vector2((x - cx) * mmPerPx, -(y - cy) * mmPerPx);
+  const shape = new THREE.Shape(outerPts.map(toV));
+  for (const hp of holePts) shape.holes.push(new THREE.Path(hp.map(toV)));
+  const geo = new THREE.ExtrudeGeometry(shape, {depth: T, bevelEnabled: false, curveSegments: 1});
+  geo.translate(0, 0, -T / 2);
+  geo.computeVertexNormals();
+
+  const bit = estimateBitting(m, W, H, mmPerPx, CUTS, KT);
+  state.geometry = geo;
+  state.result = {scaledByCard, warn: bit.warn, tolPx, code: bit.code, depths: bit.depths, side: bit.side, widthMm: W * mmPerPx, heightMm: H * mmPerPx, thickMm: T,
+                  tris: geo.attributes.position.count / 3, holes: holes.length, ms: Math.round(performance.now() - t0)};
+
+  // preview overlay: original photo with detected (aligned) silhouette
+  const pv = $('prev'); pv.classList.remove('hidden');
+  pv.width = W; pv.height = H;
+  const g = pv.getContext('2d');
+  g.fillStyle = '#0b0f14'; g.fillRect(0, 0, W, H);
+  const id = g.createImageData(W, H);
+  for (let i = 0; i < W * H; i++) { const v = m[i]; id.data[4*i] = v ? 34 : 15; id.data[4*i+1] = v ? 197 : 20; id.data[4*i+2] = v ? 232 : 27; id.data[4*i+3] = 255; }
+  g.putImageData(id, 0, 0);
+  g.strokeStyle = '#fff'; g.lineWidth = 1.5;
+  for (const p of [outerPts, ...holePts]) { g.beginPath(); p.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); g.stroke(); }
+  showModel(geo);
+  return state.result;
+}
+
+/* ---------------- 3D viewer ---------------- */
+let renderer, scene, camera, mesh, edges, dist = 80, yaw = -0.5, pitch = 0.5, dirty = true;
+function initViewer() {
+  const cv = $('view');
+  renderer = new THREE.WebGLRenderer({canvas: cv, antialias: true, preserveDrawingBuffer: true});
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  scene = new THREE.Scene(); scene.background = new THREE.Color(0x0b0f14);
+  camera = new THREE.PerspectiveCamera(40, 4/3, 0.1, 1000);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const d1 = new THREE.DirectionalLight(0xffffff, 1.1); d1.position.set(1, 2, 3); scene.add(d1);
+  const d2 = new THREE.DirectionalLight(0x66ccff, 0.5); d2.position.set(-2, -1, -2); scene.add(d2);
+  const grid = new THREE.GridHelper(200, 20, 0x2a3a4d, 0x1c2733); grid.rotation.x = Math.PI / 2; grid.position.z = -8; scene.add(grid);
+
+  let pts = new Map(), lastPinch = 0;
+  cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); pts.set(e.pointerId, [e.clientX, e.clientY]); });
+  cv.addEventListener('pointerup', e => { pts.delete(e.pointerId); lastPinch = 0; });
+  cv.addEventListener('pointercancel', e => { pts.delete(e.pointerId); lastPinch = 0; });
+  cv.addEventListener('pointermove', e => {
+    if (!pts.has(e.pointerId)) return;
+    const prev = pts.get(e.pointerId);
+    if (pts.size === 1) {
+      yaw -= (e.clientX - prev[0]) * 0.01; pitch += (e.clientY - prev[1]) * 0.01;
+      pitch = Math.max(-1.5, Math.min(1.5, pitch));
+    }
+    pts.set(e.pointerId, [e.clientX, e.clientY]);
+    if (pts.size === 2) {
+      const [a, b] = [...pts.values()]; const d = Math.hypot(a[0]-b[0], a[1]-b[1]);
+      if (lastPinch) dist *= lastPinch / d; lastPinch = d;
+    }
+    dist = Math.max(15, Math.min(400, dist)); dirty = true;
+  });
+  cv.addEventListener('wheel', e => { e.preventDefault(); dist = Math.max(15, Math.min(400, dist * (1 + e.deltaY * 0.001))); dirty = true; }, {passive: false});
+  new ResizeObserver(() => { dirty = true; }).observe(cv);
+  (function loop() { requestAnimationFrame(loop); if (dirty) render(); })();
+}
+function render() {
+  dirty = false;
+  const cv = $('view'), w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  camera.position.set(dist * Math.sin(yaw) * Math.cos(pitch), -dist * Math.sin(pitch), dist * Math.cos(yaw) * Math.cos(pitch));
+  camera.up.set(0, 1, 0); camera.lookAt(0, 0, 0);
+  renderer.render(scene, camera);
+}
+function showModel(geo) {
+  if (mesh) { scene.remove(mesh); scene.remove(edges); }
+  mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color: 0x22c5e8, metalness: 0.25, roughness: 0.45, flatShading: true}));
+  edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 35), new THREE.LineBasicMaterial({color: 0xbff4ff}));
+  scene.add(mesh, edges);
+  geo.computeBoundingBox(); const s = geo.boundingBox.getSize(new THREE.Vector3());
+  dist = Math.max(s.x, s.y) * 1.9; yaw = -0.5; pitch = 0.45; dirty = true;
+}
+
+/* ---------------- STL export ---------------- */
+function stlBytes(geo) {
+  const p = geo.attributes.position.array, n = p.length / 9;
+  const buf = new ArrayBuffer(84 + n * 50), dv = new DataView(buf);
+  dv.setUint32(80, n, true);
+  let o = 84;
+  for (let i = 0; i < n; i++) {
+    const a = [p[9*i], p[9*i+1], p[9*i+2]], b = [p[9*i+3], p[9*i+4], p[9*i+5]], c = [p[9*i+6], p[9*i+7], p[9*i+8]];
+    const u = [b[0]-a[0], b[1]-a[1], b[2]-a[2]], v = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+    let nx = u[1]*v[2]-u[2]*v[1], ny = u[2]*v[0]-u[0]*v[2], nz = u[0]*v[1]-u[1]*v[0];
+    const l = Math.hypot(nx, ny, nz) || 1; nx /= l; ny /= l; nz /= l;
+    for (const f of [nx, ny, nz, ...a, ...b, ...c]) { dv.setFloat32(o, f, true); o += 4; }
+    o += 2;
+  }
+  return new Uint8Array(buf);
+}
+function objText(geo) {
+  const p = geo.attributes.position.array, n = p.length / 3, out = ['# KeyForge3D', 'o key'];
+  for (let i = 0; i < n; i++) out.push('v ' + p[3*i].toFixed(4) + ' ' + p[3*i+1].toFixed(4) + ' ' + p[3*i+2].toFixed(4));
+  for (let i = 0; i < n; i += 3) out.push('f ' + (i+1) + ' ' + (i+2) + ' ' + (i+3));
+  return new TextEncoder().encode(out.join('\n') + '\n');
+}
+function toB64(bytes) { let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(bin); }
+function exportFile(kind, share) {
+  if (!state.geometry) return;
+  const stl = kind === 'stl', bytes = stl ? stlBytes(state.geometry) : objText(state.geometry);
+  const name = 'key_model.' + kind, mime = stl ? 'model/stl' : 'text/plain';
+  if (window.Android && Android.saveFile) { (share ? Android.shareFile : Android.saveFile)(name, mime, toB64(bytes)); return; }
+  const file = new File([bytes], name, {type: mime});
+  if (share && navigator.canShare && navigator.canShare({files: [file]})) { navigator.share({files: [file]}).catch(() => {}); return; }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; a.click();
+}
+
+/* ---------------- UI ---------------- */
+function setStatus(t, err) { const s = $('status'); s.textContent = t; s.className = err ? 'err' : ''; }
+function run() {
+  try {
+    const r = process(+$('thr').value);
+    $('resCard').classList.remove('hidden');
+    $('code').textContent = r.code.length ? r.code.join('') : '-';
+    $('dims').textContent = `${r.widthMm.toFixed(1)} x ${r.heightMm.toFixed(1)} x ${r.thickMm.toFixed(1)} mm · ${r.tris} triangles` +
+      (r.depths ? ` · cuts on ${r.side} edge: ${r.depths.map(d => d.toFixed(2)).join(', ')} mm` : '') +
+      (r.warn ? ' · WARNING: measured depths exceed this key type\'s range, so the code is unreliable (wrong key type, or blade not fully detected).' : '');
+    $('save').disabled = $('saveObj').disabled = $('share').disabled = false;
+    setStatus((r.scaledByCard ? 'Key detected; scaled from the card in the photo' : 'Key detected; scaled from the length you entered') + ' (' + r.ms + ' ms).');
+  } catch (e) {
+    $('save').disabled = $('saveObj').disabled = $('share').disabled = true; $('resCard').classList.add('hidden');
+    setStatus(e.message || String(e), true);
+  }
+}
+function loadFile(f) {
+  const url = URL.createObjectURL(f), img = new Image();
+  img.onload = () => { state.img = img; setStatus('Processing...'); setTimeout(run, 30); };
+  img.onerror = () => setStatus('Could not read that image.', true);
+  img.src = url;
+}
+$('file').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+$('thr').addEventListener('input', e => { $('thrv').textContent = e.target.value; });
+$('thr').addEventListener('change', run);
+for (const id of ['len', 'thick', 'cuts', 'ktype', 'tol']) $(id).addEventListener('change', run);
+$('save').addEventListener('click', () => exportFile('stl'));
+$('saveObj').addEventListener('click', () => exportFile('obj'));
+$('share').addEventListener('click', () => exportFile('stl', true));
+$('cam').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+initViewer();
+</script>
+</body>
+</html>
