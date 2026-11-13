@@ -81,7 +81,7 @@ const state = {img: null, geometry: null, result: null};
 window.__kf = state;
 
 /* ---------------- image processing ---------------- */
-const MAXDIM = 700;
+const MAXDIM = 1200;
 
 function loadToCanvas(img) {
   const s = Math.min(1, MAXDIM / Math.max(img.naturalWidth, img.naturalHeight));
@@ -209,8 +209,11 @@ function erodeMask(mask, w, h, r) {
 }
 const KEYTYPES = {
   generic: {inc: 0.33,  first: 0, last: 9, pins: 0},
-  schlage: {inc: 0.381, first: 0, last: 9, pins: 5},   // 0.015" steps
-  kwikset: {inc: 0.584, first: 1, last: 7, pins: 5}    // 0.023" steps
+  // Spec values (inches -> mm) are from memory of published tables; verify against a gauge before relying on them.
+  schlage: {inc: 0.381, first: 0, last: 9, pins: 5, spec: true, firstCut: 0.231 * 25.4, spacing: 0.156 * 25.4,
+            height: d => (0.335 - 0.015 * d) * 25.4},
+  kwikset: {inc: 0.584, first: 1, last: 7, pins: 5, spec: true, firstCut: 0.247 * 25.4, spacing: 0.153 * 25.4,
+            height: d => (0.329 - 0.023 * (d - 1)) * 25.4}
 };
 function segment(gray, w, h, adjust) {
   // polarity: background = what the image border looks like
@@ -385,6 +388,39 @@ function estimateBitting(m, W, H, mmPerPx, cuts, kt) {
   return {code, depths: code.map(c => (c - kt.first) * kt.inc), rawDepths: depths, warn, side: useBottom ? 'bottom' : 'top'};
 }
 
+// Spec-based bitting: locate the shoulder, sample the blade height at each real pin position,
+// and pick the nearest valid depth. Residuals give a per-pin confidence.
+function estimateBittingSpec(m, W, H, mmPerPx, kt) {
+  const top = new Float32Array(W).fill(-1), bot = new Float32Array(W).fill(-1);
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < H; y++) if (m[y*W+x]) { top[x] = y; break; }
+    for (let y = H-1; y >= 0; y--) if (m[y*W+x]) { bot[x] = y; break; }
+  }
+  const hgt = x => top[x] < 0 ? 0 : bot[x] - top[x] + 1;
+  let Hmax = 0; for (let x = 0; x < W; x++) Hmax = Math.max(Hmax, hgt(x));
+  let xs = 0; for (let x = 0; x < W; x++) if (hgt(x) >= 0.6 * Hmax) xs = x;   // right edge of the bow = shoulder
+  const win = Math.max(1, Math.round(0.4 / mmPerPx));
+  const med = a => { a = a.slice().sort((p, q) => p - q); return a[a.length >> 1]; };
+  // which edge carries the cuts: the one that varies more along the blade
+  const bladeCols = []; for (let x = xs + 2; x < W; x++) if (top[x] >= 0) bladeCols.push(x);
+  const vr = a => { const v = bladeCols.map(x => a[x]); const mu = v.reduce((p, q) => p + q, 0) / (v.length || 1); return v.reduce((p, q) => p + (q-mu)**2, 0) / (v.length || 1); };
+  const useBottom = vr(bot) >= vr(top);
+  const code = [], heights = [], resid = [];
+  for (let i = 0; i < kt.pins; i++) {
+    const cx = Math.round(xs + (kt.firstCut + i * kt.spacing) / mmPerPx);
+    const cols = []; for (let x = cx - win; x <= cx + win; x++) if (x >= 0 && x < W && top[x] >= 0) cols.push(x);
+    if (cols.length < win) { code.push('?'); heights.push(NaN); resid.push(NaN); continue; }
+    const hs = cols.map(x => bot[x] - top[x] + 1).sort((p, q) => p - q);
+    const h = hs[Math.floor(hs.length * 0.25)] * mmPerPx;   // low quartile: blur rounds off the narrow valley floor
+    let bd = kt.first, br = 1e9;
+    for (let d = kt.first; d <= kt.last; d++) { const r = Math.abs(kt.height(d) - h); if (r < br) { br = r; bd = d; } }
+    code.push(bd); heights.push(h); resid.push(br);
+  }
+  const good = resid.filter(r => !isNaN(r));
+  const warn = good.length < kt.pins || good.some(r => r > 0.6 * kt.inc);
+  return {code, depths: heights, resid, warn, side: useBottom ? 'bottom' : 'top', shoulderMm: xs * mmPerPx, spec: true};
+}
+
 function process(adjust) {
   if (!state.img) return;
   const t0 = performance.now();
@@ -429,9 +465,9 @@ function process(adjust) {
   geo.translate(0, 0, -T / 2);
   geo.computeVertexNormals();
 
-  const bit = estimateBitting(m, W, H, mmPerPx, CUTS, KT);
+  const bit = KT.spec ? estimateBittingSpec(m, W, H, mmPerPx, KT) : estimateBitting(m, W, H, mmPerPx, CUTS, KT);
   state.geometry = geo;
-  state.result = {scaledByCard, warn: bit.warn, tolPx, code: bit.code, depths: bit.depths, side: bit.side, widthMm: W * mmPerPx, heightMm: H * mmPerPx, thickMm: T,
+  state.result = {spec: !!bit.spec, resid: bit.resid, scaledByCard, warn: bit.warn, tolPx, code: bit.code, depths: bit.depths, side: bit.side, widthMm: W * mmPerPx, heightMm: H * mmPerPx, thickMm: T,
                   tris: geo.attributes.position.count / 3, holes: holes.length, ms: Math.round(performance.now() - t0)};
 
   // preview overlay: original photo with detected (aligned) silhouette
@@ -542,7 +578,7 @@ function run() {
     $('resCard').classList.remove('hidden');
     $('code').textContent = r.code.length ? r.code.join('') : '-';
     $('dims').textContent = `${r.widthMm.toFixed(1)} x ${r.heightMm.toFixed(1)} x ${r.thickMm.toFixed(1)} mm · ${r.tris} triangles` +
-      (r.depths ? ` · cuts on ${r.side} edge: ${r.depths.map(d => d.toFixed(2)).join(', ')} mm` : '') +
+      (r.depths ? (r.spec ? ` · blade height at each pin: ${r.depths.map(d => d.toFixed(2)).join(', ')} mm (match error ${r.resid.map(d => d.toFixed(2)).join(', ')})` : ` · cuts on ${r.side} edge: ${r.depths.map(d => d.toFixed(2)).join(', ')} mm`) : '') +
       (r.warn ? ' · WARNING: measured depths exceed this key type\'s range, so the code is unreliable (wrong key type, or blade not fully detected).' : '');
     $('save').disabled = $('saveObj').disabled = $('share').disabled = false;
     setStatus((r.scaledByCard ? 'Key detected; scaled from the card in the photo' : 'Key detected; scaled from the length you entered') + ' (' + r.ms + ' ms).');
