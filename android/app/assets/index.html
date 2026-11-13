@@ -46,7 +46,7 @@ canvas{display:block;width:100%;border-radius:8px;background:#0b0f14}
     </div>
     <div class="thr">Threshold adjust <span id="thrv">0</span>
       <input id="thr" type="range" min="-60" max="60" value="0"></div>
-    <div class="hint">Lay the key flat on a plain contrasting background, photographed straight on.</div>
+    <div class="hint">Lay the key flat on a plain contrasting background, photographed straight on. For true scale, put a credit/ID card in the shot (not touching the key); otherwise the key length above is used.</div>
   </div>
 
   <div class="card">
@@ -155,6 +155,43 @@ function closeMask(mask, w, h, r) {
   };
   return pass(pass(mask, true), false);
 }
+// all 4-connected components >= minArea, as arrays of pixel indices (largest first)
+function listComponents(mask, w, h, minArea) {
+  const seen = new Uint8Array(w * h), stack = new Int32Array(w * h), out = [];
+  for (let i = 0; i < w * h; i++) {
+    if (!mask[i] || seen[i]) continue;
+    let sp = 0; const px = []; stack[sp++] = i; seen[i] = 1;
+    while (sp) {
+      const p = stack[--sp]; px.push(p);
+      const x = p % w, y = (p / w) | 0;
+      if (x > 0 && mask[p-1] && !seen[p-1]) { seen[p-1] = 1; stack[sp++] = p-1; }
+      if (x < w-1 && mask[p+1] && !seen[p+1]) { seen[p+1] = 1; stack[sp++] = p+1; }
+      if (y > 0 && mask[p-w] && !seen[p-w]) { seen[p-w] = 1; stack[sp++] = p-w; }
+      if (y < h-1 && mask[p+w] && !seen[p+w]) { seen[p+w] = 1; stack[sp++] = p+w; }
+    }
+    if (px.length >= minArea) out.push(px);
+  }
+  return out.sort((a, b) => b.length - a.length);
+}
+
+// Look for an ISO/ID-1 card (85.6 x 53.98 mm) among the non-key blobs: returns its long side in px, or 0
+function findCard(comps, w) {
+  for (let ci = 0; ci < comps.length; ci++) {
+    const px = comps[ci];
+    let mx = 0, my = 0; for (const p of px) { mx += p % w; my += (p / w) | 0; }
+    mx /= px.length; my /= px.length;
+    let sxx = 0, syy = 0, sxy = 0;
+    for (const p of px) { const dx = p % w - mx, dy = ((p / w) | 0) - my; sxx += dx*dx; syy += dy*dy; sxy += dx*dy; }
+    const a = 0.5 * Math.atan2(2 * sxy, sxx - syy), ca = Math.cos(a), sa = Math.sin(a);
+    let u0 = 1e9, u1 = -1e9, v0 = 1e9, v1 = -1e9;
+    for (const p of px) { const dx = p % w - mx, dy = ((p / w) | 0) - my, u = dx*ca + dy*sa, v = -dx*sa + dy*ca;
+      if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v; }
+    const U = u1 - u0 + 1, V = v1 - v0 + 1, ratio = Math.max(U, V) / Math.min(U, V), fill = px.length / (U * V);
+    if (ratio > 1.45 && ratio < 1.75 && fill > 0.9) return {idx: ci, px: Math.max(U, V)};
+  }
+  return null;
+}
+
 function segment(gray, w, h, adjust) {
   // polarity: background = what the image border looks like
   let bs = 0, bn = 0;
@@ -334,7 +371,15 @@ function process(adjust) {
   const {c, w, h, data} = loadToCanvas(state.img);
   const gray = toGray(data, w, h);
   const seg = segment(gray, w, h, adjust);
-  const comp = largestComponent(closeMask(seg.mask, w, h, 4), w, h);
+  const closed = closeMask(seg.mask, w, h, 4);
+  const comps = listComponents(closed, w, h, w * h * 0.005);
+  const keyMask = new Uint8Array(w * h);
+  // a card only counts if some other blob remains to be the key
+  const card = comps.length > 1 ? findCard(comps, w) : null;
+  const cardPx = card ? card.px : 0;
+  const keyPx = comps.filter((_, i) => !card || i !== card.idx)[0];
+  if (keyPx) for (const p of keyPx) keyMask[p] = 1;
+  const comp = {mask: keyMask, area: keyPx ? keyPx.length : 0};
   if (comp.area < w * h * 0.01) throw new Error('No key found. Use a plain, contrasting background.');
   removeSmallHoles(comp.mask, w, h, 30);
   const al = alignMask(comp.mask, w, h);
@@ -347,7 +392,8 @@ function process(adjust) {
   const loops = boundaryLoops(m, W, H).map(p => ({p, a: area(p)})).sort((x, y) => Math.abs(y.a) - Math.abs(x.a));
   const outer = loops[0];
   const holes = loops.slice(1).filter(l => Math.sign(l.a) !== Math.sign(outer.a) && Math.abs(l.a) > 40);
-  const mmPerPx = L / W;
+  const mmPerPx = cardPx ? 85.6 / cardPx : L / W;  // card in frame -> real scale, else typed length
+  const scaledByCard = !!cardPx;
   const prep = p => chaikin(dp(p, 1.0), 1);
   const outerPts = prep(outer.p), holePts = holes.map(l => prep(l.p));
 
@@ -362,7 +408,7 @@ function process(adjust) {
 
   const bit = estimateBitting(m, W, H, mmPerPx, CUTS);
   state.geometry = geo;
-  state.result = {code: bit.code, depths: bit.depths, side: bit.side, widthMm: L, heightMm: H * mmPerPx, thickMm: T,
+  state.result = {scaledByCard, code: bit.code, depths: bit.depths, side: bit.side, widthMm: W * mmPerPx, heightMm: H * mmPerPx, thickMm: T,
                   tris: geo.attributes.position.count / 3, holes: holes.length, ms: Math.round(performance.now() - t0)};
 
   // preview overlay: original photo with detected (aligned) silhouette
@@ -469,7 +515,7 @@ function run() {
     $('dims').textContent = `${r.widthMm.toFixed(1)} x ${r.heightMm.toFixed(1)} x ${r.thickMm.toFixed(1)} mm · ${r.tris} triangles` +
       (r.depths ? ` · cuts on ${r.side} edge: ${r.depths.map(d => d.toFixed(2)).join(', ')} mm` : '');
     $('save').disabled = false;
-    setStatus('Key detected. Model built in ' + r.ms + ' ms.');
+    setStatus((r.scaledByCard ? 'Key detected; scaled from the card in the photo' : 'Key detected; scaled from the length you entered') + ' (' + r.ms + ' ms).');
   } catch (e) {
     $('save').disabled = true; $('resCard').classList.add('hidden');
     setStatus(e.message || String(e), true);
