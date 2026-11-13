@@ -18,6 +18,7 @@ import java.io.OutputStream;
 public class MainActivity extends Activity {
     private WebView web;
     ValueCallback<Uri[]> chooserCb;
+    Uri captureUri;
     static final int REQ_PICK = 1;
 
     @Override
@@ -38,8 +39,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         if (req == REQ_PICK && chooserCb != null) {
-            Uri[] r = (res == RESULT_OK && data != null && data.getData() != null)
-                    ? new Uri[]{data.getData()} : null;
+            Uri[] r = null;
+            if (res == RESULT_OK) {
+                if (captureUri != null) r = new Uri[]{captureUri};
+                else if (data != null && data.getData() != null) r = new Uri[]{data.getData()};
+            } else if (captureUri != null) {
+                try { getContentResolver().delete(captureUri, null, null); } catch (Exception e) { }
+            }
+            captureUri = null;
             chooserCb.onReceiveValue(r);
             chooserCb = null;
         }
